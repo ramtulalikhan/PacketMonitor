@@ -6,10 +6,12 @@ import java.io.FileInputStream
 import java.text.SimpleDateFormat
 import java.util.*
 
+data class Pkt(val date: String, val time: String, val size: Int, val src: String, val dst: String, val proto: String)
+
 class CaptureVpnService : VpnService() {
     companion object {
         @Volatile var running = false
-        val log: MutableList<String> = Collections.synchronizedList(LinkedList())
+        val log: MutableList<Pkt> = Collections.synchronizedList(LinkedList())
     }
 
     private var tun: ParcelFileDescriptor? = null
@@ -24,7 +26,8 @@ class CaptureVpnService : VpnService() {
         Thread {
             val input = FileInputStream(tun!!.fileDescriptor)
             val buf = ByteArray(32767)
-            val fmt = SimpleDateFormat("dd-MM-yyyy HH:mm:ss.SSS", Locale.US)
+            val df = SimpleDateFormat("dd-MM-yyyy", Locale.US)
+            val tf = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
             while (running) {
                 val len = input.read(buf)
                 if (len > 20 && (buf[0].toInt() shr 4) == 4) {
@@ -38,7 +41,8 @@ class CaptureVpnService : VpnService() {
                         dp = ((buf[ihl + 2].toInt() and 0xFF) shl 8) or (buf[ihl + 3].toInt() and 0xFF)
                     }
                     val p = when (proto) { 6 -> "TCP"; 17 -> "UDP"; 1 -> "ICMP"; else -> "$proto" }
-                    log.add(0, "${fmt.format(Date())} | $len B | $src:$sp -> $dst:$dp | $p")
+                    val now = Date()
+                    log.add(0, Pkt(df.format(now), tf.format(now), len, "$src:$sp", "$dst:$dp", p))
                     while (log.size > 100) log.removeAt(log.size - 1)
                 }
             }
