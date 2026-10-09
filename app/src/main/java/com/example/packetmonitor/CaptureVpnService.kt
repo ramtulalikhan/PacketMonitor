@@ -164,10 +164,12 @@ class CaptureVpnService : VpnService() {
             val i = if (outbound) 0 else 1
             if (outbound) { bytesOut.addAndGet(size.toLong()); pktOut.incrementAndGet() }
             else { bytesIn.addAndGet(size.toLong()); pktIn.incrementAndGet() }
-            val a = ipStats.getOrPut(remIp) { LongArray(3) }
-            a[i] += size.toLong(); a[2] += 1
-            val b = appStats.getOrPut(app) { LongArray(3) }
-            b[i] += size.toLong(); b[2] += 1
+            val a: LongArray = ipStats.getOrPut(remIp) { LongArray(3) }
+            a[i] = a[i] + size.toLong()
+            a[2] = a[2] + 1L
+            val b: LongArray = appStats.getOrPut(app) { LongArray(3) }
+            b[i] = b[i] + size.toLong()
+            b[2] = b[2] + 1L
         }
     }
 
