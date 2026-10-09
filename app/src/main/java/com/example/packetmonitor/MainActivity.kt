@@ -15,6 +15,7 @@ import android.os.Handler
 import android.os.Looper
 import android.provider.MediaStore
 import android.text.Editable
+import android.text.InputType
 import android.text.TextWatcher
 import android.view.View
 import android.view.ViewGroup
@@ -67,13 +68,16 @@ class MainActivity : AppCompatActivity() {
     private lateinit var search: EditText
     private lateinit var protoBtn: Button
     private lateinit var timeBtn: Button
+    private lateinit var rangeBtn: Button
     private lateinit var graph: Graph
     private val rows = ArrayList<List<String>>()
     private var mode = 0
     private var protoF = "ALL"
     private var timeIdx = 0
+    private var rangeIdx = 0
     private val timeNames = arrayOf("ALL", "1m", "10m", "1h")
     private val timeMs = longArrayOf(0L, 60000L, 600000L, 3600000L)
+    private val rangeNames = arrayOf("Today", "7 days", "Month", "All")
     private var lastBi = 0L; private var lastBo = 0L; private var lastPi = 0L; private var lastPo = 0L
     private val W = 0xFFEEEEEE.toInt()
     private val HC = 0xFFFFD54F.toInt()
@@ -81,12 +85,14 @@ class MainActivity : AppCompatActivity() {
     private val heads = arrayOf(
         arrayOf("Date", "Time.ms", "", "Size", "App", "Source IP:Port", "Dest IP:Port", "Domain", "Proto"),
         arrayOf("Server IP", "Domain", "Sent", "Received", "Packets"),
-        arrayOf("App", "Sent", "Received", "Packets", "Status")
+        arrayOf("App", "Sent", "Received", "Packets", "Status"),
+        arrayOf("App", "Sent", "Received", "Total", "Daily limit")
     )
     private val wids = arrayOf(
         intArrayOf(85, 95, 28, 60, 110, 150, 150, 170, 50),
         intArrayOf(140, 190, 90, 90, 70),
-        intArrayOf(170, 100, 100, 80, 110)
+        intArrayOf(170, 100, 100, 80, 110),
+        intArrayOf(170, 90, 90, 90, 120)
     )
 
     private fun dp(x: Int) = (x * resources.displayMetrics.density).toInt()
@@ -111,6 +117,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun btn(t: String, f: () -> Unit) = Button(this).apply {
         text = t; textSize = 11f
+        minHeight = 0; minimumHeight = 0
         layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         setOnClickListener { f() }
     }
@@ -146,13 +153,25 @@ class MainActivity : AppCompatActivity() {
                     if (rows.size >= 300) break
                 }
             }
-            else -> {
+            2 -> {
                 val items = CaptureVpnService.appStats.entries.sortedByDescending { it.value[0] + it.value[1] }
                 for (e in items) {
                     val v = e.value
                     val st = if (CaptureVpnService.blocked.contains(e.key)) "BLOCKED" else ""
                     val c = listOf(e.key, fmt(v[0]), fmt(v[1]), "${v[2]}", st)
                     if (q.isEmpty() || c.joinToString(" ").lowercase().contains(q)) rows.add(c)
+                }
+            }
+            else -> {
+                val rep = Store.report(rangeIdx)
+                var ts = 0L; var tr = 0L
+                for (t in rep) { ts += t.second; tr += t.third }
+                rows.add(listOf("TOTAL", fmt(ts), fmt(tr), fmt(ts + tr), ""))
+                for (t in rep) {
+                    if (q.isNotEmpty() && !t.first.lowercase().contains(q)) continue
+                    val l = Store.limits[t.first]
+                    val ls = if (l != null) "${l / 1048576L} MB/day" else ""
+                    rows.add(listOf(t.first, fmt(t.second), fmt(t.third), fmt(t.second + t.third), ls))
                 }
             }
         }
@@ -172,7 +191,7 @@ class MainActivity : AppCompatActivity() {
                 "⬆ Sent: ${fmt(bo)}  (${fmt(dO)}/s)\n" +
                 "Packets in: $pi  (+${maxOf(0L, pi - lastPi)}/s)  out: $po  (+${maxOf(0L, po - lastPo)}/s)\n" +
                 "Capture: ${if (CaptureVpnService.running) "ON" else "OFF"} | Servers: ${CaptureVpnService.ipStats.size} | Apps: ${CaptureVpnService.appStats.size}\n" +
-                "Blocked apps: ${CaptureVpnService.blocked.size} | Dropped pkts: ${CaptureVpnService.blockedCount.get()}"
+                "Blocked: ${CaptureVpnService.blocked.size} | Dropped: ${CaptureVpnService.blockedCount.get()} | Limits: ${Store.limits.size}"
             lastBi = bi; lastBo = bo; lastPi = pi; lastPo = po
             refresh()
             h.postDelayed(this, 1000)
@@ -233,8 +252,50 @@ class MainActivity : AppCompatActivity() {
             .putStringSet("blocked", HashSet(CaptureVpnService.blocked)).apply()
     }
 
+    private fun askLimit(app: String) {
+        val et = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_NUMBER
+            hint = "MB per day (0 = remove limit)"
+            val cur = Store.limits[app]
+            if (cur != null) setText("${cur / 1048576L}")
+        }
+        android.app.AlertDialog.Builder(this)
+            .setTitle("Daily limit: $app")
+            .setView(et)
+            .setPositiveButton("Save") { _, _ ->
+                val mbv = et.text.toString().toLongOrNull() ?: 0L
+                if (mbv <= 0L) Store.limits.remove(app) else Store.limits[app] = mbv * 1048576L
+                Store.saveLimits()
+                Store.alerted.removeAll { it.endsWith("\t$app") }
+                refresh()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun pickApp() {
+        val names = ArrayList<String>()
+        names.addAll(CaptureVpnService.appStats.keys)
+        for (k in Store.limits.keys) if (!names.contains(k)) names.add(k)
+        for (k in Store.usage.keys) {
+            val a = k.substringAfter('\t')
+            if (!names.contains(a)) names.add(a)
+        }
+        names.removeAll { it == "-" || it == "?" }
+        names.sort()
+        if (names.isEmpty()) {
+            Toast.makeText(this, "No apps yet. Start capture first.", Toast.LENGTH_SHORT).show()
+            return
+        }
+        android.app.AlertDialog.Builder(this)
+            .setTitle("Pick app")
+            .setItems(names.toTypedArray()) { _, i -> askLimit(names[i]) }
+            .show()
+    }
+
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
+        Store.init(this)
         val bg = 0xFF121212.toInt()
 
         val saved = getSharedPreferences("pm", MODE_PRIVATE).getStringSet("blocked", null)
@@ -248,7 +309,7 @@ class MainActivity : AppCompatActivity() {
             setBackgroundColor(0xFF1E2A38.toInt()); setPadding(dp(14), dp(8), dp(14), dp(8))
         }
         graph = Graph(this).apply {
-            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(70))
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(60))
         }
 
         val row1 = LinearLayout(this).apply {
@@ -269,6 +330,24 @@ class MainActivity : AppCompatActivity() {
             addView(btn("BY APP") { setMode(2) })
             addView(btn("CSV") { exportCsv() })
             addView(btn("PCAP") { exportPcap() })
+        }
+        rangeBtn = btn("Today") {
+            rangeIdx = (rangeIdx + 1) % rangeNames.size
+            rangeBtn.text = rangeNames[rangeIdx]
+            if (mode == 3) refresh()
+        }
+        val row4 = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(btn("REPORT") { setMode(3) })
+            addView(rangeBtn)
+            addView(btn("LIMIT") { pickApp() })
+            addView(btn("CLR HIST") {
+                android.app.AlertDialog.Builder(this@MainActivity)
+                    .setTitle("Delete saved usage history?")
+                    .setPositiveButton("Delete") { _, _ -> Store.usage.clear(); Store.flush(); refresh() }
+                    .setNegativeButton("Cancel", null)
+                    .show()
+            })
         }
 
         search = EditText(this).apply {
@@ -325,6 +404,7 @@ class MainActivity : AppCompatActivity() {
                         if (k == 4) col = 0xFFFFF59D.toInt()
                     }
                     if (mode == 2 && k == 4) { col = 0xFFFF5252.toInt(); bold = true }
+                    if (mode == 3 && r[0] == "TOTAL") { col = HC; bold = true }
                     cells.add(cell(r[k], w[k], col, bold))
                 }
                 return rowOf(cells).apply {
@@ -338,9 +418,13 @@ class MainActivity : AppCompatActivity() {
             divider = null
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
             setOnItemClickListener { _, _, pos, _ ->
-                if (pos < rows.size && (mode == 1 || mode == 2)) {
-                    search.setText(rows[pos][0])
-                    setMode(0)
+                if (pos < rows.size) {
+                    if (mode == 1 || mode == 2) {
+                        search.setText(rows[pos][0])
+                        setMode(0)
+                    } else if (mode == 3 && rows[pos][0] != "TOTAL") {
+                        askLimit(rows[pos][0])
+                    }
                 }
             }
             setOnItemLongClickListener { _, _, pos, _ ->
@@ -372,7 +456,7 @@ class MainActivity : AppCompatActivity() {
         setContentView(LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(bg)
-            addView(stats); addView(graph); addView(row1); addView(row2); addView(row3); addView(hscroll)
+            addView(stats); addView(graph); addView(row1); addView(row2); addView(row4); addView(row3); addView(hscroll)
         })
 
         buildHeader()
