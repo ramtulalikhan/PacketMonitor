@@ -65,10 +65,13 @@ class MainActivity : AppCompatActivity() {
     private lateinit var adapter: BaseAdapter
     private lateinit var header: LinearLayout
     private lateinit var table: LinearLayout
+    private lateinit var hscroll: HorizontalScrollView
     private lateinit var search: EditText
     private lateinit var protoBtn: Button
     private lateinit var timeBtn: Button
     private lateinit var rangeBtn: Button
+    private lateinit var autoBtn: Button
+    private lateinit var adBtn: Button
     private lateinit var graph: Graph
     private val rows = ArrayList<List<String>>()
     private var mode = 0
@@ -96,6 +99,8 @@ class MainActivity : AppCompatActivity() {
     )
 
     private fun dp(x: Int) = (x * resources.displayMetrics.density).toInt()
+
+    private fun onOff(b: Boolean) = if (b) "ON" else "OFF"
 
     private fun fmt(b: Long): String = when {
         b >= 1048576L -> String.format("%.1f MB", b / 1048576.0)
@@ -179,7 +184,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun refresh() { rebuild(); adapter.notifyDataSetChanged() }
 
-    private fun setMode(m: Int) { mode = m; buildHeader(); refresh() }
+    private fun setMode(m: Int) { mode = m; buildHeader(); refresh(); hscroll.scrollTo(0, 0) }
 
     private val ticker = object : Runnable {
         override fun run() {
@@ -190,8 +195,9 @@ class MainActivity : AppCompatActivity() {
             stats.text = "⬇ Received: ${fmt(bi)}  (${fmt(di)}/s)\n" +
                 "⬆ Sent: ${fmt(bo)}  (${fmt(dO)}/s)\n" +
                 "Packets in: $pi  (+${maxOf(0L, pi - lastPi)}/s)  out: $po  (+${maxOf(0L, po - lastPo)}/s)\n" +
-                "Capture: ${if (CaptureVpnService.running) "ON" else "OFF"} | Servers: ${CaptureVpnService.ipStats.size} | Apps: ${CaptureVpnService.appStats.size}\n" +
-                "Blocked: ${CaptureVpnService.blocked.size} | Dropped: ${CaptureVpnService.blockedCount.get()} | Limits: ${Store.limits.size}"
+                "Capture: ${onOff(CaptureVpnService.running)} | Servers: ${CaptureVpnService.ipStats.size} | Apps: ${CaptureVpnService.appStats.size}\n" +
+                "Blocked apps: ${CaptureVpnService.blocked.size} | Dropped: ${CaptureVpnService.blockedCount.get()} | Limits: ${Store.limits.size}\n" +
+                "AutoBlock: ${onOff(Store.autoBlock)} | AdBlock: ${onOff(Store.adBlock)} | DNS blocked: ${CaptureVpnService.domainBlocked.get()}"
             lastBi = bi; lastBo = bo; lastPi = pi; lastPo = po
             refresh()
             h.postDelayed(this, 1000)
@@ -293,6 +299,55 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
+    private fun askDomain() {
+        val et = EditText(this).apply {
+            hint = "domain e.g. ads.example.com"
+            setSingleLine(true)
+        }
+        android.app.AlertDialog.Builder(this)
+            .setTitle("Block domain")
+            .setView(et)
+            .setPositiveButton("Add") { _, _ ->
+                val d = et.text.toString().trim().lowercase()
+                if (d.contains(".") && !d.contains(" ")) {
+                    Store.customDomains.add(d); Store.saveFlags()
+                    Toast.makeText(this, "Blocked: $d", Toast.LENGTH_SHORT).show()
+                } else {
+                    Toast.makeText(this, "Invalid domain", Toast.LENGTH_SHORT).show()
+                }
+            }
+            .setNeutralButton("List") { _, _ -> listDomains() }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun listDomains() {
+        val l = Store.customDomains.sorted()
+        if (l.isEmpty()) {
+            Toast.makeText(this, "No custom blocked domains", Toast.LENGTH_SHORT).show()
+            return
+        }
+        android.app.AlertDialog.Builder(this)
+            .setTitle("Tap a domain to unblock")
+            .setItems(l.toTypedArray()) { _, i ->
+                Store.customDomains.remove(l[i]); Store.saveFlags()
+                Toast.makeText(this, "Unblocked: ${l[i]}", Toast.LENGTH_SHORT).show()
+            }
+            .show()
+    }
+
+    private fun confirmBlockDomain(dm: String) {
+        android.app.AlertDialog.Builder(this)
+            .setTitle("Block this domain?")
+            .setMessage(dm)
+            .setPositiveButton("Block") { _, _ ->
+                Store.customDomains.add(dm.lowercase()); Store.saveFlags()
+                Toast.makeText(this, "Blocked: $dm", Toast.LENGTH_SHORT).show()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
         Store.init(this)
@@ -306,10 +361,10 @@ class MainActivity : AppCompatActivity() {
 
         stats = TextView(this).apply {
             textSize = 12f; setTextColor(W); typeface = Typeface.MONOSPACE
-            setBackgroundColor(0xFF1E2A38.toInt()); setPadding(dp(14), dp(8), dp(14), dp(8))
+            setBackgroundColor(0xFF1E2A38.toInt()); setPadding(dp(14), dp(6), dp(14), dp(6))
         }
         graph = Graph(this).apply {
-            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(60))
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(50))
         }
 
         val row1 = LinearLayout(this).apply {
@@ -348,6 +403,22 @@ class MainActivity : AppCompatActivity() {
                     .setNegativeButton("Cancel", null)
                     .show()
             })
+        }
+        autoBtn = btn("AUTOBLK: ${onOff(Store.autoBlock)}") {
+            Store.autoBlock = !Store.autoBlock
+            Store.saveFlags()
+            autoBtn.text = "AUTOBLK: ${onOff(Store.autoBlock)}"
+        }
+        adBtn = btn("ADBLOCK: ${onOff(Store.adBlock)}") {
+            Store.adBlock = !Store.adBlock
+            Store.saveFlags()
+            adBtn.text = "ADBLOCK: ${onOff(Store.adBlock)}"
+        }
+        val row5 = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(autoBtn)
+            addView(adBtn)
+            addView(btn("DOMAINS") { askDomain() })
         }
 
         search = EditText(this).apply {
@@ -402,6 +473,7 @@ class MainActivity : AppCompatActivity() {
                         }
                         if (k == 2) { col = if (r[k] == "↑") 0xFFFF8A65.toInt() else 0xFF4DD0E1.toInt(); bold = true }
                         if (k == 4) col = 0xFFFFF59D.toInt()
+                        if (k == 7 && r[k].startsWith("✖")) { col = 0xFFFF5252.toInt(); bold = true }
                     }
                     if (mode == 2 && k == 4) { col = 0xFFFF5252.toInt(); bold = true }
                     if (mode == 3 && r[0] == "TOTAL") { col = HC; bold = true }
@@ -419,7 +491,10 @@ class MainActivity : AppCompatActivity() {
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
             setOnItemClickListener { _, _, pos, _ ->
                 if (pos < rows.size) {
-                    if (mode == 1 || mode == 2) {
+                    if (mode == 0) {
+                        val dm = rows[pos][7].removePrefix("✖ ").trim()
+                        if (dm.isNotEmpty()) confirmBlockDomain(dm)
+                    } else if (mode == 1 || mode == 2) {
                         search.setText(rows[pos][0])
                         setMode(0)
                     } else if (mode == 3 && rows[pos][0] != "TOTAL") {
@@ -447,7 +522,7 @@ class MainActivity : AppCompatActivity() {
             orientation = LinearLayout.VERTICAL
             addView(header); addView(list)
         }
-        val hscroll = HorizontalScrollView(this).apply {
+        hscroll = HorizontalScrollView(this).apply {
             isFillViewport = true
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
             addView(table)
@@ -456,7 +531,7 @@ class MainActivity : AppCompatActivity() {
         setContentView(LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(bg)
-            addView(stats); addView(graph); addView(row1); addView(row2); addView(row4); addView(row3); addView(hscroll)
+            addView(stats); addView(graph); addView(row1); addView(row2); addView(row4); addView(row5); addView(row3); addView(hscroll)
         })
 
         buildHeader()
