@@ -1,6 +1,9 @@
 package com.example.packetmonitor
 
+import android.content.Context
+import android.net.ConnectivityManager
 import android.net.VpnService
+import android.os.Build
 import android.os.ParcelFileDescriptor
 import java.io.FileInputStream
 import java.io.FileOutputStream
@@ -9,8 +12,13 @@ import java.text.SimpleDateFormat
 import java.util.*
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.atomic.AtomicLong
 
-data class Pkt(val date: String, val time: String, val size: Int, val src: String, val dst: String, val proto: String)
+data class Pkt(
+    val date: String, val time: String, val size: Int,
+    val src: String, val dst: String, val proto: String,
+    val app: String, val domain: String, val out: Boolean
+)
 
 class Conn(
     val phoneIp: ByteArray, val phonePort: Int,
@@ -29,6 +37,12 @@ class CaptureVpnService : VpnService() {
     companion object {
         @Volatile var running = false
         val log: MutableList<Pkt> = Collections.synchronizedList(LinkedList())
+        val dns = ConcurrentHashMap<String, String>()
+        val ipStats = ConcurrentHashMap<String, LongArray>()   // [sent, received, packets]
+        val appStats = ConcurrentHashMap<String, LongArray>()
+        val bytesIn = AtomicLong(); val bytesOut = AtomicLong()
+        val pktIn = AtomicLong(); val pktOut = AtomicLong()
+        fun clearAll() { log.clear(); ipStats.clear(); appStats.clear() }
     }
 
     private val M = 0xFFFFFFFFL
@@ -36,6 +50,8 @@ class CaptureVpnService : VpnService() {
     private lateinit var out: FileOutputStream
     private val udp = ConcurrentHashMap<String, DatagramSocket>()
     private val tcp = ConcurrentHashMap<String, Conn>()
+    private val appCache = ConcurrentHashMap<String, String>()
+    private val uidName = ConcurrentHashMap<Int, String>()
     private val df = SimpleDateFormat("dd-MM-yyyy", Locale.US)
     private val tf = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
 
@@ -61,11 +77,98 @@ class CaptureVpnService : VpnService() {
         return s.inv() and 0xFFFF
     }
 
-    @Synchronized
-    private fun addLog(s: String, sp: Int, d: String, dp: Int, size: Int, proto: String) {
-        val now = Date()
-        log.add(0, Pkt(df.format(now), tf.format(now), size, "$s:$sp", "$d:$dp", proto))
-        while (log.size > 200) log.removeAt(log.size - 1)
+    // ---------------- App name ----------------
+    private fun labelOf(uid: Int): String = uidName.getOrPut(uid) {
+        try {
+            val pk = packageManager.getPackagesForUid(uid)
+            if (pk.isNullOrEmpty()) "uid $uid"
+            else packageManager.getApplicationLabel(packageManager.getApplicationInfo(pk[0], 0)).toString()
+        } catch (e: Exception) { "uid $uid" }
+    }
+
+    private fun appName(proto: Int, phonePort: Int, remIp: String, remPort: Int): String {
+        if (proto != 6 && proto != 17) return "-"
+        if (Build.VERSION.SDK_INT < 29) return "?"
+        val key = "$proto:$phonePort:$remIp:$remPort"
+        appCache[key]?.let { return it }
+        var name = "?"
+        try {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            val uid = cm.getConnectionOwnerUid(
+                proto,
+                InetSocketAddress(InetAddress.getByName("10.0.0.2"), phonePort),
+                InetSocketAddress(InetAddress.getByName(remIp), remPort)
+            )
+            if (uid >= 0) name = labelOf(uid)
+        } catch (e: Exception) { }
+        if (appCache.size > 3000) appCache.clear()
+        appCache[key] = name
+        return name
+    }
+
+    // ---------------- DNS ----------------
+    private fun readName(b: ByteArray, start: Int, n: Int): Pair<String, Int> {
+        val sb = StringBuilder(); var o = start; var end = -1; var hops = 0
+        while (o < n && hops < 20) {
+            val l = b[o].toInt() and 0xFF
+            if (l == 0) { if (end < 0) end = o + 1; break }
+            if ((l and 0xC0) == 0xC0) {
+                if (o + 1 >= n) break
+                if (end < 0) end = o + 2
+                o = ((l and 0x3F) shl 8) or (b[o + 1].toInt() and 0xFF)
+                hops++; continue
+            }
+            if (o + 1 + l > n) break
+            if (sb.isNotEmpty()) sb.append('.')
+            sb.append(String(b, o + 1, l, Charsets.US_ASCII))
+            o += 1 + l
+        }
+        return Pair(sb.toString(), if (end < 0) n else end)
+    }
+
+    private fun parseDns(d: ByteArray, n: Int): String? {
+        try {
+            if (n < 12) return null
+            val qd = u16(d, 4); val an = u16(d, 6)
+            var o = 12; var qname = ""
+            for (i in 0 until qd) {
+                val r = readName(d, o, n)
+                if (i == 0) qname = r.first
+                o = r.second + 4
+            }
+            for (i in 0 until an) {
+                if (o >= n) break
+                o = readName(d, o, n).second
+                if (o + 10 > n) break
+                val type = u16(d, o); val rdlen = u16(d, o + 8)
+                o += 10
+                if (type == 1 && rdlen == 4 && o + 4 <= n && qname.isNotEmpty()) dns[ip(d, o)] = qname
+                o += rdlen
+            }
+            return qname
+        } catch (e: Exception) { return null }
+    }
+
+    // ---------------- Logging ----------------
+    private fun logPkt(outbound: Boolean, proto: Int, phonePort: Int, remIp: String, remPort: Int, size: Int, dnsName: String? = null) {
+        val app = appName(proto, phonePort, remIp, remPort)
+        synchronized(this) {
+            val now = Date()
+            val domain = dnsName ?: dns[remIp] ?: ""
+            val phone = "10.0.0.2:$phonePort"
+            val rem = "$remIp:$remPort"
+            val pn = when (proto) { 6 -> "TCP"; 17 -> "UDP"; 1 -> "ICMP"; else -> "$proto" }
+            log.add(0, Pkt(df.format(now), tf.format(now), size,
+                if (outbound) phone else rem, if (outbound) rem else phone, pn, app, domain, outbound))
+            while (log.size > 5000) log.removeAt(log.size - 1)
+            val i = if (outbound) 0 else 1
+            if (outbound) { bytesOut.addAndGet(size.toLong()); pktOut.incrementAndGet() }
+            else { bytesIn.addAndGet(size.toLong()); pktIn.incrementAndGet() }
+            val a = ipStats.getOrPut(remIp) { LongArray(3) }
+            a[i] += size.toLong(); a[2] += 1
+            val b = appStats.getOrPut(app) { LongArray(3) }
+            b[i] += size.toLong(); b[2] += 1
+        }
     }
 
     // ---------------- UDP ----------------
@@ -79,7 +182,8 @@ class CaptureVpnService : VpnService() {
         put16(p, 20, srvPort); put16(p, 22, phonePort); put16(p, 24, 8 + n)
         System.arraycopy(data, 0, p, 28, n)
         try { synchronized(out) { out.write(p) } } catch (e: Exception) { return }
-        addLog(ip(srvIp, 0), srvPort, ip(phoneIp, 0), phonePort, total, "UDP")
+        val dn = if (srvPort == 53) parseDns(data, n) else null
+        logPkt(false, 17, phonePort, ip(srvIp, 0), srvPort, total, dn)
     }
 
     private fun handleUdp(buf: ByteArray, ihl: Int) {
@@ -134,7 +238,7 @@ class CaptureVpnService : VpnService() {
         s = sum(p, 20, total - 20, s)
         put16(p, 36, fold(s))
         try { synchronized(out) { out.write(p) } } catch (e: Exception) { return }
-        addLog(ip(c.srvIp, 0), c.srvPort, ip(c.phoneIp, 0), c.phonePort, total, "TCP")
+        logPkt(false, 6, c.phonePort, ip(c.srvIp, 0), c.srvPort, total)
     }
 
     private fun closeConn(key: String, c: Conn) {
@@ -149,16 +253,15 @@ class CaptureVpnService : VpnService() {
             try {
                 val s = Socket()
                 s.bind(null)
-                protect(s)                       // zaroori: VPN se bahar jaye
+                protect(s)
                 s.connect(InetSocketAddress(InetAddress.getByAddress(c.srvIp), c.srvPort), 10000)
                 s.tcpNoDelay = true
                 c.sock = s
                 synchronized(c) {
-                    writeTcp(c, 0x12, c.sndNxt, c.rcvNxt, null, 0, true)   // SYN+ACK
+                    writeTcp(c, 0x12, c.sndNxt, c.rcvNxt, null, 0, true)
                     c.sndNxt = (c.sndNxt + 1) and M
                     c.peerAck = c.sndNxt
                 }
-                // phone -> server writer
                 Thread {
                     try {
                         val os = s.getOutputStream()
@@ -172,7 +275,6 @@ class CaptureVpnService : VpnService() {
                         }
                     } catch (e: Exception) { }
                 }.start()
-                // server -> phone reader
                 val inp = s.getInputStream()
                 val rb = ByteArray(1400)
                 while (!c.closed) {
@@ -181,13 +283,13 @@ class CaptureVpnService : VpnService() {
                     while (!c.closed && ((c.sndNxt - c.peerAck) and M) >= 32768) Thread.sleep(2)
                     if (c.closed) break
                     synchronized(c) {
-                        writeTcp(c, 0x18, c.sndNxt, c.rcvNxt, rb, n)       // PSH+ACK
+                        writeTcp(c, 0x18, c.sndNxt, c.rcvNxt, rb, n)
                         c.sndNxt = (c.sndNxt + n) and M
                     }
                 }
                 if (!c.closed) {
                     synchronized(c) {
-                        writeTcp(c, 0x11, c.sndNxt, c.rcvNxt, null, 0)    // FIN+ACK
+                        writeTcp(c, 0x11, c.sndNxt, c.rcvNxt, null, 0)
                         c.sndNxt = (c.sndNxt + 1) and M
                     }
                     c.srvFin = true
@@ -195,7 +297,7 @@ class CaptureVpnService : VpnService() {
                 }
             } catch (e: Exception) {
                 if (!c.closed) {
-                    synchronized(c) { writeTcp(c, 0x14, c.sndNxt, c.rcvNxt, null, 0) }  // RST+ACK
+                    synchronized(c) { writeTcp(c, 0x14, c.sndNxt, c.rcvNxt, null, 0) }
                     closeConn(key, c)
                 }
             }
@@ -213,8 +315,8 @@ class CaptureVpnService : VpnService() {
         val key = "$sp>${ip(buf, 16)}:$dp"
         val c = tcp[key]
 
-        if (flags and 4 != 0) { if (c != null) closeConn(key, c); return }
-        if (flags and 2 != 0) {
+        if ((flags and 4) != 0) { if (c != null) closeConn(key, c); return }
+        if ((flags and 2) != 0) {
             if (c == null) {
                 val nc = Conn(
                     buf.copyOfRange(12, 16), sp, buf.copyOfRange(16, 20), dp,
@@ -226,7 +328,7 @@ class CaptureVpnService : VpnService() {
             return
         }
         if (c == null || c.sock == null) return
-        if (flags and 16 != 0) c.peerAck = ack
+        if ((flags and 16) != 0) c.peerAck = ack
 
         var needAck = false
         if (payLen > 0) {
@@ -236,7 +338,7 @@ class CaptureVpnService : VpnService() {
                 c.outq.put(buf.copyOfRange(ihl + doff, ihl + doff + payLen))
             }
         }
-        if (flags and 1 != 0 && !c.phoneFin && ((seq + payLen) and M) == c.rcvNxt) {
+        if ((flags and 1) != 0 && !c.phoneFin && ((seq + payLen) and M) == c.rcvNxt) {
             c.rcvNxt = (c.rcvNxt + 1) and M
             c.phoneFin = true
             c.outq.put(ByteArray(0))
@@ -268,8 +370,9 @@ class CaptureVpnService : VpnService() {
                         val proto = buf[9].toInt() and 0xFF
                         var sp = 0; var dp = 0
                         if ((proto == 6 || proto == 17) && len >= ihl + 4) { sp = u16(buf, ihl); dp = u16(buf, ihl + 2) }
-                        val name = when (proto) { 6 -> "TCP"; 17 -> "UDP"; 1 -> "ICMP"; else -> "$proto" }
-                        addLog(ip(buf, 12), sp, ip(buf, 16), dp, len, name)
+                        var dn: String? = null
+                        if (proto == 17 && dp == 53 && len > ihl + 21) dn = readName(buf, ihl + 20, len).first
+                        logPkt(true, proto, sp, ip(buf, 16), dp, len, dn)
                         if (proto == 17 && len >= ihl + 8) handleUdp(buf, ihl)
                         if (proto == 6) handleTcp(buf, len, ihl)
                     }
