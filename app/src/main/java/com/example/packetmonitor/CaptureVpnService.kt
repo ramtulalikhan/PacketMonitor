@@ -49,8 +49,29 @@ object Store {
     val limits = ConcurrentHashMap<String, Long>()          // app -> bytes per day
     val seen: MutableSet<String> = ConcurrentHashMap.newKeySet()
     val alerted: MutableSet<String> = ConcurrentHashMap.newKeySet()
+    val autoBlocked: MutableSet<String> = ConcurrentHashMap.newKeySet()   // "date\tapp"
+    val customDomains: MutableSet<String> = ConcurrentHashMap.newKeySet()
+    @Volatile var autoBlock = false
+    @Volatile var adBlock = false
+
+    private val ads = arrayOf(
+        "doubleclick.net", "googlesyndication.com", "googleadservices.com", "adservice.google.com",
+        "ads.youtube.com", "google-analytics.com", "app-measurement.com", "adcolony.com",
+        "applovin.com", "unityads.unity3d.com", "ads.tiktok.com", "analytics.tiktok.com",
+        "moatads.com", "adnxs.com", "taboola.com", "outbrain.com", "scorecardresearch.com",
+        "adsrvr.org", "criteo.com", "amazon-adsystem.com", "ads.twitter.com", "ads-api.twitter.com",
+        "inmobi.com", "mopub.com", "chartboost.com", "vungle.com", "ironsrc.com"
+    )
 
     fun today(): String = LocalDate.now().toString()
+
+    fun isBlocked(name: String): Boolean {
+        val n = name.lowercase().trimEnd('.')
+        if (n.isEmpty()) return false
+        for (d in customDomains) if (n == d || n.endsWith(".$d")) return true
+        if (adBlock) for (d in ads) if (n == d || n.endsWith(".$d")) return true
+        return false
+    }
 
     @Synchronized
     fun init(ctx: Context) {
@@ -73,6 +94,21 @@ object Store {
         }
         val sn = p.getStringSet("seen", null)
         if (sn != null) seen.addAll(sn)
+        autoBlock = p.getBoolean("autoblock", false)
+        adBlock = p.getBoolean("adblock", false)
+        val dm = p.getStringSet("domains", null)
+        if (dm != null) customDomains.addAll(dm)
+        val ab = p.getStringSet("autoblocked", null)
+        if (ab != null) autoBlocked.addAll(ab)
+    }
+
+    fun saveFlags() {
+        prefs?.edit()
+            ?.putBoolean("autoblock", autoBlock)
+            ?.putBoolean("adblock", adBlock)
+            ?.putStringSet("domains", HashSet(customDomains))
+            ?.putStringSet("autoblocked", HashSet(autoBlocked))
+            ?.apply()
     }
 
     @Synchronized
@@ -144,6 +180,7 @@ class CaptureVpnService : VpnService() {
         val pktIn = AtomicLong(); val pktOut = AtomicLong()
         val blocked: MutableSet<String> = ConcurrentHashMap.newKeySet()
         val blockedCount = AtomicLong()
+        val domainBlocked = AtomicLong()
         val pcap = LinkedList<Pair<Long, ByteArray>>()
         fun clearAll() {
             log.clear(); ipStats.clear(); appStats.clear()
@@ -192,6 +229,11 @@ class CaptureVpnService : VpnService() {
         }
     }
 
+    private fun saveBlockedPrefs() {
+        getSharedPreferences("pm", Context.MODE_PRIVATE).edit()
+            .putStringSet("blocked", HashSet(blocked)).apply()
+    }
+
     // ---------------- Notifications ----------------
     private fun kb(b: Long): String =
         if (b >= 1048576L) String.format("%.1f MB", b / 1048576.0) else String.format("%.0f KB", b / 1024.0)
@@ -230,10 +272,36 @@ class CaptureVpnService : VpnService() {
     }
 
     private fun checkLimits() {
+        val td = Store.today()
+
+        // purane din ke auto-block hatao
+        val it = Store.autoBlocked.iterator()
+        var changed = false
+        while (it.hasNext()) {
+            val k = it.next()
+            if (!k.startsWith(td)) {
+                blocked.remove(k.substringAfter('\t'))
+                it.remove()
+                changed = true
+            }
+        }
+        if (changed) { saveBlockedPrefs(); Store.saveFlags() }
+
         for ((app, lim) in Store.limits) {
             val used = Store.todayTotal(app)
-            val key = Store.today() + "\t" + app
-            if (used >= lim && Store.alerted.add(key)) {
+            if (used < lim) continue
+            val key = td + "\t" + app
+            val first = Store.alerted.add(key)
+            var didBlock = false
+            if (Store.autoBlock && Store.autoBlocked.add(key)) {
+                blocked.add(app)
+                saveBlockedPrefs()
+                Store.saveFlags()
+                didBlock = true
+            }
+            if (didBlock) {
+                alertNotif("Limit reached - app BLOCKED", "$app used ${mb(used)} today (limit ${mb(lim)}). Auto-unblock tomorrow.")
+            } else if (first) {
                 alertNotif("Data limit reached", "$app used ${mb(used)} today (limit ${mb(lim)})")
             }
         }
@@ -321,6 +389,20 @@ class CaptureVpnService : VpnService() {
         } catch (e: Exception) { return null }
     }
 
+    // Blocked domain ke liye "domain nahi mila" (NXDOMAIN) jawab banao
+    private fun replyBlocked(buf: ByteArray, ihl: Int, len: Int, name: String) {
+        try {
+            val d = ihl + 8
+            val qEnd = readName(buf, d + 12, len).second + 4
+            if (qEnd > len || qEnd <= d + 12) return
+            val n = qEnd - d
+            val r = buf.copyOfRange(d, qEnd)
+            r[2] = 0x81.toByte(); r[3] = 0x83.toByte()
+            for (k in 6..11) r[k] = 0
+            writeUdp(buf.copyOfRange(12, 16), u16(buf, ihl), buf.copyOfRange(16, 20), u16(buf, ihl + 2), r, n, "✖ $name")
+        } catch (e: Exception) { }
+    }
+
     // ---------------- TLS SNI ----------------
     private fun parseSni(b: ByteArray, off: Int, end: Int): String? {
         try {
@@ -376,7 +458,7 @@ class CaptureVpnService : VpnService() {
     }
 
     // ---------------- UDP ----------------
-    private fun writeUdp(phoneIp: ByteArray, phonePort: Int, srvIp: ByteArray, srvPort: Int, data: ByteArray, n: Int) {
+    private fun writeUdp(phoneIp: ByteArray, phonePort: Int, srvIp: ByteArray, srvPort: Int, data: ByteArray, n: Int, label: String? = null) {
         val total = 28 + n
         val p = ByteArray(total)
         p[0] = 0x45; put16(p, 2, total); p[6] = 0x40; p[8] = 64; p[9] = 17
@@ -387,7 +469,7 @@ class CaptureVpnService : VpnService() {
         System.arraycopy(data, 0, p, 28, n)
         try { synchronized(out) { out.write(p) } } catch (e: Exception) { return }
         keepRaw(p, total)
-        val dn = if (srvPort == 53) parseDns(data, n) else null
+        val dn = label ?: (if (srvPort == 53) parseDns(data, n) else null)
         logPkt(false, 17, phonePort, ip(srvIp, 0), srvPort, total, dn)
     }
 
@@ -562,6 +644,8 @@ class CaptureVpnService : VpnService() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         Store.init(this)
         learnUntil = if (Store.seen.isEmpty()) System.currentTimeMillis() + 90000L else 0L
+        val sb0 = getSharedPreferences("pm", Context.MODE_PRIVATE).getStringSet("blocked", null)
+        if (sb0 != null) blocked.addAll(sb0)
 
         val n = buildNotif("Capture starting...")
         if (Build.VERSION.SDK_INT >= 34) {
@@ -589,7 +673,7 @@ class CaptureVpnService : VpnService() {
                 try { nm.notify(1, buildNotif("Down ${kb(i - li)}/s   Up ${kb(o - lo)}/s")) } catch (e: Exception) { }
                 li = i; lo = o
                 tick++
-                if (tick % 5 == 0) checkLimits()
+                if (tick % 3 == 0) checkLimits()
                 if (tick % 10 == 0) Store.flush()
             }
             Store.flush()
@@ -615,7 +699,17 @@ class CaptureVpnService : VpnService() {
 
                         keepRaw(buf, len)
                         var dn: String? = null
-                        if (proto == 17 && dp == 53 && len > ihl + 21) dn = readName(buf, ihl + 20, len).first
+                        if (proto == 17 && dp == 53 && len > ihl + 21) {
+                            val isQuery = (u16(buf, ihl + 10) and 0x8000) == 0
+                            val nm = readName(buf, ihl + 20, len).first
+                            dn = nm
+                            if (isQuery && nm.isNotEmpty() && Store.isBlocked(nm)) {
+                                logPkt(true, proto, sp, remIp, dp, len, "✖ $nm")
+                                replyBlocked(buf, ihl, len, nm)
+                                domainBlocked.incrementAndGet()
+                                continue
+                            }
+                        }
                         logPkt(true, proto, sp, remIp, dp, len, dn)
                         if (proto == 17 && len >= ihl + 8) handleUdp(buf, ihl)
                         if (proto == 6) handleTcp(buf, len, ihl)
