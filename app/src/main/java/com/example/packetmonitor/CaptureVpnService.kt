@@ -1,6 +1,12 @@
 package com.example.packetmonitor
 
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
 import android.content.Context
+import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
 import android.net.VpnService
 import android.os.Build
@@ -17,7 +23,7 @@ import java.util.concurrent.atomic.AtomicLong
 data class Pkt(
     val date: String, val time: String, val size: Int,
     val src: String, val dst: String, val proto: String,
-    val app: String, val domain: String, val out: Boolean
+    val app: String, val domain: String, val out: Boolean, val ts: Long
 )
 
 class Conn(
@@ -30,6 +36,7 @@ class Conn(
     @Volatile var closed = false
     @Volatile var srvFin = false
     @Volatile var phoneFin = false
+    @Volatile var sniDone = false
     val outq = LinkedBlockingQueue<ByteArray>()
 }
 
@@ -38,11 +45,17 @@ class CaptureVpnService : VpnService() {
         @Volatile var running = false
         val log: MutableList<Pkt> = Collections.synchronizedList(LinkedList())
         val dns = ConcurrentHashMap<String, String>()
-        val ipStats = ConcurrentHashMap<String, LongArray>()   // [sent, received, packets]
+        val ipStats = ConcurrentHashMap<String, LongArray>()
         val appStats = ConcurrentHashMap<String, LongArray>()
         val bytesIn = AtomicLong(); val bytesOut = AtomicLong()
         val pktIn = AtomicLong(); val pktOut = AtomicLong()
-        fun clearAll() { log.clear(); ipStats.clear(); appStats.clear() }
+        val blocked: MutableSet<String> = ConcurrentHashMap.newKeySet()
+        val blockedCount = AtomicLong()
+        val pcap = LinkedList<Pair<Long, ByteArray>>()
+        fun clearAll() {
+            log.clear(); ipStats.clear(); appStats.clear()
+            synchronized(pcap) { pcap.clear() }
+        }
     }
 
     private val M = 0xFFFFFFFFL
@@ -75,6 +88,32 @@ class CaptureVpnService : VpnService() {
         var s = s0
         while (s ushr 16 != 0) s = (s and 0xFFFF) + (s ushr 16)
         return s.inv() and 0xFFFF
+    }
+
+    private fun keepRaw(p: ByteArray, n: Int) {
+        synchronized(pcap) {
+            pcap.addLast(Pair(System.currentTimeMillis(), p.copyOf(n)))
+            while (pcap.size > 4000) pcap.removeFirst()
+        }
+    }
+
+    // ---------------- Notification ----------------
+    private fun kb(b: Long): String =
+        if (b >= 1048576L) String.format("%.1f MB", b / 1048576.0) else String.format("%.0f KB", b / 1024.0)
+
+    private fun buildNotif(text: String): Notification {
+        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        if (Build.VERSION.SDK_INT >= 26) {
+            nm.createNotificationChannel(NotificationChannel("pm", "PacketMonitor", NotificationManager.IMPORTANCE_LOW))
+        }
+        val pi = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
+        val b = if (Build.VERSION.SDK_INT >= 26) Notification.Builder(this, "pm") else Notification.Builder(this)
+        return b.setSmallIcon(android.R.drawable.stat_notify_sync)
+            .setContentTitle("PacketMonitor")
+            .setContentText(text)
+            .setContentIntent(pi)
+            .setOngoing(true)
+            .build()
     }
 
     // ---------------- App name ----------------
@@ -149,6 +188,34 @@ class CaptureVpnService : VpnService() {
         } catch (e: Exception) { return null }
     }
 
+    // ---------------- TLS SNI ----------------
+    private fun parseSni(b: ByteArray, off: Int, end: Int): String? {
+        try {
+            if (end - off < 45) return null
+            if ((b[off].toInt() and 0xFF) != 0x16) return null
+            if ((b[off + 5].toInt() and 0xFF) != 0x01) return null
+            var o = off + 9
+            o += 2 + 32
+            o += 1 + (b[o].toInt() and 0xFF)
+            o += 2 + u16(b, o)
+            o += 1 + (b[o].toInt() and 0xFF)
+            val extEnd = o + 2 + u16(b, o)
+            o += 2
+            val lim = minOf(extEnd, end)
+            while (o + 4 <= lim) {
+                val type = u16(b, o); val len = u16(b, o + 2)
+                o += 4
+                if (type == 0 && o + 5 <= end) {
+                    val nl = u16(b, o + 3)
+                    if (o + 5 + nl <= end) return String(b, o + 5, nl, Charsets.US_ASCII)
+                    return null
+                }
+                o += len
+            }
+        } catch (e: Exception) { }
+        return null
+    }
+
     // ---------------- Logging ----------------
     private fun logPkt(outbound: Boolean, proto: Int, phonePort: Int, remIp: String, remPort: Int, size: Int, dnsName: String? = null) {
         val app = appName(proto, phonePort, remIp, remPort)
@@ -159,7 +226,7 @@ class CaptureVpnService : VpnService() {
             val rem = "$remIp:$remPort"
             val pn = when (proto) { 6 -> "TCP"; 17 -> "UDP"; 1 -> "ICMP"; else -> "$proto" }
             log.add(0, Pkt(df.format(now), tf.format(now), size,
-                if (outbound) phone else rem, if (outbound) rem else phone, pn, app, domain, outbound))
+                if (outbound) phone else rem, if (outbound) rem else phone, pn, app, domain, outbound, now.time))
             while (log.size > 5000) log.removeAt(log.size - 1)
             val i = if (outbound) 0 else 1
             if (outbound) { bytesOut.addAndGet(size.toLong()); pktOut.incrementAndGet() }
@@ -184,6 +251,7 @@ class CaptureVpnService : VpnService() {
         put16(p, 20, srvPort); put16(p, 22, phonePort); put16(p, 24, 8 + n)
         System.arraycopy(data, 0, p, 28, n)
         try { synchronized(out) { out.write(p) } } catch (e: Exception) { return }
+        keepRaw(p, total)
         val dn = if (srvPort == 53) parseDns(data, n) else null
         logPkt(false, 17, phonePort, ip(srvIp, 0), srvPort, total, dn)
     }
@@ -219,7 +287,6 @@ class CaptureVpnService : VpnService() {
     }
 
     // ---------------- TCP ----------------
-    // flags: FIN=1 SYN=2 RST=4 PSH=8 ACK=16
     private fun writeTcp(c: Conn, flags: Int, seq: Long, ack: Long, data: ByteArray?, n: Int, mss: Boolean = false) {
         val th = if (mss) 24 else 20
         val total = 20 + th + n
@@ -240,6 +307,7 @@ class CaptureVpnService : VpnService() {
         s = sum(p, 20, total - 20, s)
         put16(p, 36, fold(s))
         try { synchronized(out) { out.write(p) } } catch (e: Exception) { return }
+        keepRaw(p, total)
         logPkt(false, 6, c.phonePort, ip(c.srvIp, 0), c.srvPort, total)
     }
 
@@ -336,6 +404,11 @@ class CaptureVpnService : VpnService() {
         if (payLen > 0) {
             needAck = true
             if (seq == c.rcvNxt) {
+                if (!c.sniDone) {
+                    c.sniDone = true
+                    val name = parseSni(buf, ihl + doff, ihl + doff + payLen)
+                    if (name != null && name.isNotEmpty()) dns[ip(c.srvIp, 0)] = name
+                }
                 c.rcvNxt = (c.rcvNxt + payLen) and M
                 c.outq.put(buf.copyOfRange(ihl + doff, ihl + doff + payLen))
             }
@@ -351,7 +424,14 @@ class CaptureVpnService : VpnService() {
     }
 
     // ---------------- main ----------------
-    override fun onStartCommand(intent: android.content.Intent?, flags: Int, startId: Int): Int {
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val n = buildNotif("Capture starting...")
+        if (Build.VERSION.SDK_INT >= 34) {
+            startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+        } else {
+            startForeground(1, n)
+        }
+
         tun = Builder()
             .setSession("PacketMonitor")
             .setMtu(1500)
@@ -360,6 +440,17 @@ class CaptureVpnService : VpnService() {
             .addDnsServer("8.8.8.8")
             .establish()
         out = FileOutputStream(tun!!.fileDescriptor)
+
+        Thread {
+            var li = bytesIn.get(); var lo = bytesOut.get()
+            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            while (running) {
+                try { Thread.sleep(1000) } catch (e: Exception) { }
+                val i = bytesIn.get(); val o = bytesOut.get()
+                try { nm.notify(1, buildNotif("Down ${kb(i - li)}/s   Up ${kb(o - lo)}/s")) } catch (e: Exception) { }
+                li = i; lo = o
+            }
+        }.start()
 
         Thread {
             val input = FileInputStream(tun!!.fileDescriptor)
@@ -372,9 +463,17 @@ class CaptureVpnService : VpnService() {
                         val proto = buf[9].toInt() and 0xFF
                         var sp = 0; var dp = 0
                         if ((proto == 6 || proto == 17) && len >= ihl + 4) { sp = u16(buf, ihl); dp = u16(buf, ihl + 2) }
+                        val remIp = ip(buf, 16)
+
+                        if ((proto == 6 || proto == 17) && blocked.isNotEmpty()) {
+                            val an = appName(proto, sp, remIp, dp)
+                            if (blocked.contains(an)) { blockedCount.incrementAndGet(); continue }
+                        }
+
+                        keepRaw(buf, len)
                         var dn: String? = null
                         if (proto == 17 && dp == 53 && len > ihl + 21) dn = readName(buf, ihl + 20, len).first
-                        logPkt(true, proto, sp, ip(buf, 16), dp, len, dn)
+                        logPkt(true, proto, sp, remIp, dp, len, dn)
                         if (proto == 17 && len >= ihl + 8) handleUdp(buf, ihl)
                         if (proto == 6) handleTcp(buf, len, ihl)
                     }
@@ -384,6 +483,7 @@ class CaptureVpnService : VpnService() {
             tcp.clear()
             udp.values.forEach { try { it.close() } catch (e: Exception) { } }
             tun?.close()
+            stopForeground(true)
             stopSelf()
         }.start()
         return START_NOT_STICKY
