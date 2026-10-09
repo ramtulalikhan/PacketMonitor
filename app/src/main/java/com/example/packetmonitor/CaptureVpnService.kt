@@ -6,6 +6,7 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.content.SharedPreferences
 import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
 import android.net.VpnService
@@ -15,9 +16,11 @@ import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.net.*
 import java.text.SimpleDateFormat
+import java.time.LocalDate
 import java.util.*
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
 data class Pkt(
@@ -38,6 +41,96 @@ class Conn(
     @Volatile var phoneFin = false
     @Volatile var sniDone = false
     val outq = LinkedBlockingQueue<ByteArray>()
+}
+
+object Store {
+    private var prefs: SharedPreferences? = null
+    val usage = ConcurrentHashMap<String, LongArray>()      // "date\tapp" -> [sent, received]
+    val limits = ConcurrentHashMap<String, Long>()          // app -> bytes per day
+    val seen: MutableSet<String> = ConcurrentHashMap.newKeySet()
+    val alerted: MutableSet<String> = ConcurrentHashMap.newKeySet()
+
+    fun today(): String = LocalDate.now().toString()
+
+    @Synchronized
+    fun init(ctx: Context) {
+        if (prefs != null) return
+        val p = ctx.applicationContext.getSharedPreferences("pm_store", Context.MODE_PRIVATE)
+        prefs = p
+        for (line in (p.getString("usage", "") ?: "").split("\n")) {
+            val f = line.split("\t")
+            if (f.size == 4) {
+                val s = f[2].toLongOrNull(); val r = f[3].toLongOrNull()
+                if (s != null && r != null) usage[f[0] + "\t" + f[1]] = longArrayOf(s, r)
+            }
+        }
+        for (line in (p.getString("limits", "") ?: "").split("\n")) {
+            val f = line.split("\t")
+            if (f.size == 2) {
+                val v = f[1].toLongOrNull()
+                if (v != null) limits[f[0]] = v
+            }
+        }
+        val sn = p.getStringSet("seen", null)
+        if (sn != null) seen.addAll(sn)
+    }
+
+    @Synchronized
+    fun flush() {
+        val p = prefs ?: return
+        val cutoff = LocalDate.now().minusDays(100).toString()
+        val sb = StringBuilder()
+        for ((k, v) in usage) {
+            if (k.substringBefore('\t') < cutoff) continue
+            sb.append(k).append('\t').append(v[0]).append('\t').append(v[1]).append('\n')
+        }
+        p.edit().putString("usage", sb.toString()).apply()
+    }
+
+    fun saveLimits() {
+        val sb = StringBuilder()
+        for ((k, v) in limits) sb.append(k).append('\t').append(v).append('\n')
+        prefs?.edit()?.putString("limits", sb.toString())?.apply()
+    }
+
+    fun saveSeen() {
+        prefs?.edit()?.putStringSet("seen", HashSet(seen))?.apply()
+    }
+
+    fun add(app: String, outbound: Boolean, size: Int) {
+        val a: LongArray = usage.getOrPut(today() + "\t" + app) { LongArray(2) }
+        val i = if (outbound) 0 else 1
+        a[i] = a[i] + size.toLong()
+    }
+
+    fun todayTotal(app: String): Long {
+        val a = usage[today() + "\t" + app] ?: return 0L
+        return a[0] + a[1]
+    }
+
+    // range: 0 = today, 1 = last 7 days, 2 = this month, 3 = all
+    fun report(range: Int): List<Triple<String, Long, Long>> {
+        val t = LocalDate.now()
+        val td = t.toString()
+        val from = t.minusDays(6).toString()
+        val month = td.substring(0, 7)
+        val m = HashMap<String, LongArray>()
+        for ((k, v) in usage) {
+            val d = k.substringBefore('\t')
+            val app = k.substringAfter('\t')
+            val ok = when (range) {
+                0 -> d == td
+                1 -> d >= from && d <= td
+                2 -> d.startsWith(month)
+                else -> true
+            }
+            if (!ok) continue
+            val a: LongArray = m.getOrPut(app) { LongArray(2) }
+            a[0] = a[0] + v[0]
+            a[1] = a[1] + v[1]
+        }
+        return m.entries.map { Triple(it.key, it.value[0], it.value[1]) }.sortedByDescending { it.second + it.third }
+    }
 }
 
 class CaptureVpnService : VpnService() {
@@ -67,6 +160,8 @@ class CaptureVpnService : VpnService() {
     private val uidName = ConcurrentHashMap<Int, String>()
     private val df = SimpleDateFormat("dd-MM-yyyy", Locale.US)
     private val tf = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
+    private val alertId = AtomicInteger(100)
+    @Volatile private var learnUntil = 0L
 
     private fun u16(b: ByteArray, o: Int) = ((b[o].toInt() and 0xFF) shl 8) or (b[o + 1].toInt() and 0xFF)
     private fun u32(b: ByteArray, o: Int): Long =
@@ -97,9 +192,11 @@ class CaptureVpnService : VpnService() {
         }
     }
 
-    // ---------------- Notification ----------------
+    // ---------------- Notifications ----------------
     private fun kb(b: Long): String =
         if (b >= 1048576L) String.format("%.1f MB", b / 1048576.0) else String.format("%.0f KB", b / 1024.0)
+
+    private fun mb(b: Long): String = String.format("%.1f MB", b / 1048576.0)
 
     private fun buildNotif(text: String): Notification {
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
@@ -114,6 +211,42 @@ class CaptureVpnService : VpnService() {
             .setContentIntent(pi)
             .setOngoing(true)
             .build()
+    }
+
+    private fun alertNotif(title: String, text: String) {
+        try {
+            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            nm.createNotificationChannel(NotificationChannel("pm_alert", "PacketMonitor alerts", NotificationManager.IMPORTANCE_HIGH))
+            val pi = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
+            val n = Notification.Builder(this, "pm_alert")
+                .setSmallIcon(android.R.drawable.stat_sys_warning)
+                .setContentTitle(title)
+                .setContentText(text)
+                .setContentIntent(pi)
+                .setAutoCancel(true)
+                .build()
+            nm.notify(alertId.incrementAndGet(), n)
+        } catch (e: Exception) { }
+    }
+
+    private fun checkLimits() {
+        for ((app, lim) in Store.limits) {
+            val used = Store.todayTotal(app)
+            val key = Store.today() + "\t" + app
+            if (used >= lim && Store.alerted.add(key)) {
+                alertNotif("Data limit reached", "$app used ${mb(used)} today (limit ${mb(lim)})")
+            }
+        }
+    }
+
+    private fun checkNew(app: String) {
+        if (app == "-" || app == "?" || app.startsWith("uid ")) return
+        if (Store.seen.add(app)) {
+            Store.saveSeen()
+            if (System.currentTimeMillis() > learnUntil) {
+                alertNotif("New app using internet", app)
+            }
+        }
     }
 
     // ---------------- App name ----------------
@@ -237,7 +370,9 @@ class CaptureVpnService : VpnService() {
             val b: LongArray = appStats.getOrPut(app) { LongArray(3) }
             b[i] = b[i] + size.toLong()
             b[2] = b[2] + 1L
+            Store.add(app, outbound, size)
         }
+        checkNew(app)
     }
 
     // ---------------- UDP ----------------
@@ -425,6 +560,9 @@ class CaptureVpnService : VpnService() {
 
     // ---------------- main ----------------
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        Store.init(this)
+        learnUntil = if (Store.seen.isEmpty()) System.currentTimeMillis() + 90000L else 0L
+
         val n = buildNotif("Capture starting...")
         if (Build.VERSION.SDK_INT >= 34) {
             startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
@@ -444,12 +582,17 @@ class CaptureVpnService : VpnService() {
         Thread {
             var li = bytesIn.get(); var lo = bytesOut.get()
             val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            var tick = 0
             while (running) {
                 try { Thread.sleep(1000) } catch (e: Exception) { }
                 val i = bytesIn.get(); val o = bytesOut.get()
                 try { nm.notify(1, buildNotif("Down ${kb(i - li)}/s   Up ${kb(o - lo)}/s")) } catch (e: Exception) { }
                 li = i; lo = o
+                tick++
+                if (tick % 5 == 0) checkLimits()
+                if (tick % 10 == 0) Store.flush()
             }
+            Store.flush()
         }.start()
 
         Thread {
@@ -489,5 +632,5 @@ class CaptureVpnService : VpnService() {
         return START_NOT_STICKY
     }
 
-    override fun onDestroy() { running = false; tun?.close(); super.onDestroy() }
+    override fun onDestroy() { running = false; Store.flush(); tun?.close(); super.onDestroy() }
 }
