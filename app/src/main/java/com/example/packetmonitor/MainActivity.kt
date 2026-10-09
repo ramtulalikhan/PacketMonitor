@@ -1,7 +1,11 @@
 package com.example.packetmonitor
 
 import android.content.ContentValues
+import android.content.Context
 import android.content.Intent
+import android.graphics.Canvas
+import android.graphics.Paint
+import android.graphics.Path
 import android.graphics.Typeface
 import android.net.VpnService
 import android.os.Build
@@ -17,6 +21,42 @@ import android.view.ViewGroup
 import android.widget.*
 import androidx.appcompat.app.AppCompatActivity
 import java.io.File
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+
+class Graph(ctx: Context) : View(ctx) {
+    private val inS = ArrayList<Long>()
+    private val outS = ArrayList<Long>()
+    private val pIn = Paint().apply { color = 0xFF4DD0E1.toInt(); strokeWidth = 4f; style = Paint.Style.STROKE; isAntiAlias = true }
+    private val pOut = Paint().apply { color = 0xFFFF8A65.toInt(); strokeWidth = 4f; style = Paint.Style.STROKE; isAntiAlias = true }
+    private val pTxt = Paint().apply { color = 0xFFAAAAAA.toInt(); textSize = 26f; isAntiAlias = true }
+
+    fun add(i: Long, o: Long) {
+        inS.add(i); outS.add(o)
+        if (inS.size > 60) { inS.removeAt(0); outS.removeAt(0) }
+        invalidate()
+    }
+
+    override fun onDraw(c: Canvas) {
+        c.drawColor(0xFF161B22.toInt())
+        var mx = 1024L
+        for (v in inS) if (v > mx) mx = v
+        for (v in outS) if (v > mx) mx = v
+        val w = width.toFloat(); val h = height.toFloat()
+        fun line(d: ArrayList<Long>, p: Paint) {
+            if (d.size < 2) return
+            val path = Path()
+            for (k in d.indices) {
+                val x = w * k / 59f
+                val y = h - 8f - (h - 16f) * d[k].toFloat() / mx.toFloat()
+                if (k == 0) path.moveTo(x, y) else path.lineTo(x, y)
+            }
+            c.drawPath(path, p)
+        }
+        line(inS, pIn); line(outS, pOut)
+        c.drawText("max ${mx / 1024} KB/s   cyan=down  orange=up", 8f, 28f, pTxt)
+    }
+}
 
 class MainActivity : AppCompatActivity() {
     private val h = Handler(Looper.getMainLooper())
@@ -26,9 +66,14 @@ class MainActivity : AppCompatActivity() {
     private lateinit var table: LinearLayout
     private lateinit var search: EditText
     private lateinit var protoBtn: Button
+    private lateinit var timeBtn: Button
+    private lateinit var graph: Graph
     private val rows = ArrayList<List<String>>()
     private var mode = 0
     private var protoF = "ALL"
+    private var timeIdx = 0
+    private val timeNames = arrayOf("ALL", "1m", "10m", "1h")
+    private val timeMs = longArrayOf(0L, 60000L, 600000L, 3600000L)
     private var lastBi = 0L; private var lastBo = 0L; private var lastPi = 0L; private var lastPo = 0L
     private val W = 0xFFEEEEEE.toInt()
     private val HC = 0xFFFFD54F.toInt()
@@ -36,12 +81,12 @@ class MainActivity : AppCompatActivity() {
     private val heads = arrayOf(
         arrayOf("Date", "Time.ms", "", "Size", "App", "Source IP:Port", "Dest IP:Port", "Domain", "Proto"),
         arrayOf("Server IP", "Domain", "Sent", "Received", "Packets"),
-        arrayOf("App", "Sent", "Received", "Packets")
+        arrayOf("App", "Sent", "Received", "Packets", "Status")
     )
     private val wids = arrayOf(
         intArrayOf(85, 95, 28, 60, 110, 150, 150, 170, 50),
         intArrayOf(140, 190, 90, 90, 70),
-        intArrayOf(170, 100, 100, 80)
+        intArrayOf(170, 100, 100, 80, 110)
     )
 
     private fun dp(x: Int) = (x * resources.displayMetrics.density).toInt()
@@ -65,7 +110,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun btn(t: String, f: () -> Unit) = Button(this).apply {
-        text = t; textSize = 12f
+        text = t; textSize = 11f
         layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         setOnClickListener { f() }
     }
@@ -80,9 +125,12 @@ class MainActivity : AppCompatActivity() {
     private fun rebuild() {
         rows.clear()
         val q = search.text.toString().trim().lowercase()
+        val now = System.currentTimeMillis()
+        val lim = timeMs[timeIdx]
         when (mode) {
             0 -> synchronized(CaptureVpnService.log) {
                 for (r in CaptureVpnService.log) {
+                    if (lim > 0L && now - r.ts > lim) continue
                     if (protoF != "ALL" && r.proto != protoF) continue
                     if (q.isNotEmpty() && !(r.src + " " + r.dst + " " + r.app + " " + r.domain).lowercase().contains(q)) continue
                     rows.add(listOf(r.date, r.time, if (r.out) "↑" else "↓", "${r.size}", r.app, r.src, r.dst, r.domain, r.proto))
@@ -102,7 +150,8 @@ class MainActivity : AppCompatActivity() {
                 val items = CaptureVpnService.appStats.entries.sortedByDescending { it.value[0] + it.value[1] }
                 for (e in items) {
                     val v = e.value
-                    val c = listOf(e.key, fmt(v[0]), fmt(v[1]), "${v[2]}")
+                    val st = if (CaptureVpnService.blocked.contains(e.key)) "BLOCKED" else ""
+                    val c = listOf(e.key, fmt(v[0]), fmt(v[1]), "${v[2]}", st)
                     if (q.isEmpty() || c.joinToString(" ").lowercase().contains(q)) rows.add(c)
                 }
             }
@@ -117,11 +166,13 @@ class MainActivity : AppCompatActivity() {
         override fun run() {
             val bi = CaptureVpnService.bytesIn.get(); val bo = CaptureVpnService.bytesOut.get()
             val pi = CaptureVpnService.pktIn.get(); val po = CaptureVpnService.pktOut.get()
-            stats.text = "⬇ Received: ${fmt(bi)}  (${fmt(maxOf(0L, bi - lastBi))}/s)\n" +
-                "⬆ Sent: ${fmt(bo)}  (${fmt(maxOf(0L, bo - lastBo))}/s)\n" +
-                "Packets in: $pi  (+${maxOf(0L, pi - lastPi)}/s)\n" +
-                "Packets out: $po  (+${maxOf(0L, po - lastPo)}/s)\n" +
-                "Capture: ${if (CaptureVpnService.running) "ON" else "OFF"} | Servers: ${CaptureVpnService.ipStats.size} | Apps: ${CaptureVpnService.appStats.size}"
+            val di = maxOf(0L, bi - lastBi); val dO = maxOf(0L, bo - lastBo)
+            graph.add(di, dO)
+            stats.text = "⬇ Received: ${fmt(bi)}  (${fmt(di)}/s)\n" +
+                "⬆ Sent: ${fmt(bo)}  (${fmt(dO)}/s)\n" +
+                "Packets in: $pi  (+${maxOf(0L, pi - lastPi)}/s)  out: $po  (+${maxOf(0L, po - lastPo)}/s)\n" +
+                "Capture: ${if (CaptureVpnService.running) "ON" else "OFF"} | Servers: ${CaptureVpnService.ipStats.size} | Apps: ${CaptureVpnService.appStats.size}\n" +
+                "Blocked apps: ${CaptureVpnService.blocked.size} | Dropped pkts: ${CaptureVpnService.blockedCount.get()}"
             lastBi = bi; lastBo = bo; lastPi = pi; lastPo = po
             refresh()
             h.postDelayed(this, 1000)
@@ -130,26 +181,20 @@ class MainActivity : AppCompatActivity() {
 
     private fun q(s: String) = "\"" + s.replace("\"", "\"\"") + "\""
 
-    private fun exportCsv() {
-        val snap = synchronized(CaptureVpnService.log) { ArrayList(CaptureVpnService.log) }
-        val sb = StringBuilder("Date,Time,Direction,Size,Source,Destination,Proto,App,Domain\n")
-        for (r in snap.reversed()) {
-            sb.append("${r.date},${r.time},${if (r.out) "OUT" else "IN"},${r.size},${r.src},${r.dst},${r.proto},${q(r.app)},${q(r.domain)}\n")
-        }
-        val name = "packets_${System.currentTimeMillis()}.csv"
+    private fun saveFile(name: String, bytes: ByteArray) {
         try {
             if (Build.VERSION.SDK_INT >= 29) {
                 val v = ContentValues().apply {
                     put(MediaStore.Downloads.DISPLAY_NAME, name)
-                    put(MediaStore.Downloads.MIME_TYPE, "text/csv")
+                    put(MediaStore.Downloads.MIME_TYPE, "application/octet-stream")
                     put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
                 }
                 val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, v)!!
-                contentResolver.openOutputStream(uri)!!.use { it.write(sb.toString().toByteArray()) }
-                Toast.makeText(this, "Saved: Downloads/$name (${snap.size} rows)", Toast.LENGTH_LONG).show()
+                contentResolver.openOutputStream(uri)!!.use { it.write(bytes) }
+                Toast.makeText(this, "Saved: Downloads/$name", Toast.LENGTH_LONG).show()
             } else {
                 val f = File(getExternalFilesDir(null), name)
-                f.writeText(sb.toString())
+                f.writeBytes(bytes)
                 Toast.makeText(this, "Saved: ${f.absolutePath}", Toast.LENGTH_LONG).show()
             }
         } catch (e: Exception) {
@@ -157,13 +202,53 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun exportCsv() {
+        val snap = synchronized(CaptureVpnService.log) { ArrayList(CaptureVpnService.log) }
+        val sb = StringBuilder("Date,Time,Direction,Size,Source,Destination,Proto,App,Domain\n")
+        for (r in snap.reversed()) {
+            sb.append("${r.date},${r.time},${if (r.out) "OUT" else "IN"},${r.size},${r.src},${r.dst},${r.proto},${q(r.app)},${q(r.domain)}\n")
+        }
+        saveFile("packets_${System.currentTimeMillis()}.csv", sb.toString().toByteArray())
+    }
+
+    private fun exportPcap() {
+        val snap = synchronized(CaptureVpnService.pcap) { ArrayList(CaptureVpnService.pcap) }
+        var size = 24
+        for (p in snap) size += 16 + p.second.size
+        val bb = ByteBuffer.allocate(size).order(ByteOrder.LITTLE_ENDIAN)
+        bb.putInt(0xA1B2C3D4.toInt())
+        bb.putShort(2); bb.putShort(4)
+        bb.putInt(0); bb.putInt(0); bb.putInt(65535); bb.putInt(101)
+        for (p in snap) {
+            bb.putInt((p.first / 1000L).toInt())
+            bb.putInt(((p.first % 1000L) * 1000L).toInt())
+            bb.putInt(p.second.size); bb.putInt(p.second.size)
+            bb.put(p.second)
+        }
+        saveFile("capture_${System.currentTimeMillis()}.pcap", bb.array())
+    }
+
+    private fun saveBlocked() {
+        getSharedPreferences("pm", MODE_PRIVATE).edit()
+            .putStringSet("blocked", HashSet(CaptureVpnService.blocked)).apply()
+    }
+
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
         val bg = 0xFF121212.toInt()
 
+        val saved = getSharedPreferences("pm", MODE_PRIVATE).getStringSet("blocked", null)
+        if (saved != null) CaptureVpnService.blocked.addAll(saved)
+        if (Build.VERSION.SDK_INT >= 33) {
+            requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 2)
+        }
+
         stats = TextView(this).apply {
-            textSize = 13f; setTextColor(W); typeface = Typeface.MONOSPACE
-            setBackgroundColor(0xFF1E2A38.toInt()); setPadding(dp(14), dp(10), dp(14), dp(10))
+            textSize = 12f; setTextColor(W); typeface = Typeface.MONOSPACE
+            setBackgroundColor(0xFF1E2A38.toInt()); setPadding(dp(14), dp(8), dp(14), dp(8))
+        }
+        graph = Graph(this).apply {
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(70))
         }
 
         val row1 = LinearLayout(this).apply {
@@ -183,6 +268,7 @@ class MainActivity : AppCompatActivity() {
             addView(btn("BY IP") { setMode(1) })
             addView(btn("BY APP") { setMode(2) })
             addView(btn("CSV") { exportCsv() })
+            addView(btn("PCAP") { exportPcap() })
         }
 
         search = EditText(this).apply {
@@ -201,10 +287,15 @@ class MainActivity : AppCompatActivity() {
             protoBtn.text = protoF
             refresh()
         }
+        timeBtn = btn("ALL") {
+            timeIdx = (timeIdx + 1) % timeNames.size
+            timeBtn.text = timeNames[timeIdx]
+            refresh()
+        }
         val row3 = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             setPadding(dp(8), 0, dp(8), 0)
-            addView(search); addView(protoBtn)
+            addView(search); addView(protoBtn); addView(timeBtn)
         }
 
         header = LinearLayout(this).apply {
@@ -233,6 +324,7 @@ class MainActivity : AppCompatActivity() {
                         if (k == 2) { col = if (r[k] == "↑") 0xFFFF8A65.toInt() else 0xFF4DD0E1.toInt(); bold = true }
                         if (k == 4) col = 0xFFFFF59D.toInt()
                     }
+                    if (mode == 2 && k == 4) { col = 0xFFFF5252.toInt(); bold = true }
                     cells.add(cell(r[k], w[k], col, bold))
                 }
                 return rowOf(cells).apply {
@@ -245,6 +337,27 @@ class MainActivity : AppCompatActivity() {
             this.adapter = this@MainActivity.adapter
             divider = null
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
+            setOnItemClickListener { _, _, pos, _ ->
+                if (pos < rows.size && (mode == 1 || mode == 2)) {
+                    search.setText(rows[pos][0])
+                    setMode(0)
+                }
+            }
+            setOnItemLongClickListener { _, _, pos, _ ->
+                if (mode == 2 && pos < rows.size) {
+                    val name = rows[pos][0]
+                    if (CaptureVpnService.blocked.contains(name)) {
+                        CaptureVpnService.blocked.remove(name)
+                        Toast.makeText(this@MainActivity, "Unblocked: $name", Toast.LENGTH_SHORT).show()
+                    } else {
+                        CaptureVpnService.blocked.add(name)
+                        Toast.makeText(this@MainActivity, "Blocked: $name", Toast.LENGTH_SHORT).show()
+                    }
+                    saveBlocked()
+                    refresh()
+                }
+                true
+            }
         }
         table = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -259,11 +372,13 @@ class MainActivity : AppCompatActivity() {
         setContentView(LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(bg)
-            addView(stats); addView(row1); addView(row2); addView(row3); addView(hscroll)
+            addView(stats); addView(graph); addView(row1); addView(row2); addView(row3); addView(hscroll)
         })
 
         buildHeader()
         h.post(ticker)
+
+        if (!CaptureVpnService.running && VpnService.prepare(this) == null) startVpn()
     }
 
     @Deprecated("Deprecated in Java")
